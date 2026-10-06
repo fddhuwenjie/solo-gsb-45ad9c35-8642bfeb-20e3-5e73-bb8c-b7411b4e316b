@@ -1025,7 +1025,11 @@ class PaymentReceiptResponse(BaseModel):
 
 
 class PaymentListItem(BaseModel):
-    """收款记录列表中的一条：落盘时冻结的首收回执（列表中 result 恒为 received）。"""
+    """收款记录列表中的一条：落盘时冻结的首收回执（列表中 result 恒为 received）。
+
+    被整笔冲正的收款记录、逐凭证分配与首收回执保持原样，仅以 reversed /
+    reversed_at 展示冲正状态；其核销不再计入账户级累计有效实收。
+    """
 
     account_id: str
     payment_no: str
@@ -1044,22 +1048,32 @@ class PaymentListItem(BaseModel):
     outstanding_yuan: float = Field(description="该笔登记当时的尚欠快照")
     credit_yuan: float = Field(description="该笔登记当时的信用快照")
     payment_count: int = Field(description="该笔在账户内的收款序号（1 起）")
+    reversed: bool = Field(
+        default=False,
+        description="该笔收款是否已被整笔冲正：冲正后其核销不再计入有效实收，"
+        "但收款记录、逐凭证分配与首收回执保持原样",
+    )
+    reversed_at: Optional[str] = Field(
+        default=None,
+        description="首次冲正时间（UTC ISO 8601）；未冲正为 null",
+    )
 
 
 class PaymentListResponse(BaseModel):
     """按收款次序查询账户全部收款记录与当前最新尚欠/信用。"""
 
     account_id: str
-    payment_count: int = Field(description="账户累计收款笔数")
+    payment_count: int = Field(description="账户累计收款笔数（含已被冲正的收款记录）")
     total_received_yuan: float = Field(
-        description="当前账户累计实收（全部收款金额之和，随新增收款增长）"
+        description="当前账户累计有效实收（未冲正收款金额之和；被冲正收款不再计入）"
     )
     outstanding_yuan: float = Field(
-        description="当前最新尚欠（随后续入账的应补/应退凭证变化；补退不改旧分配）"
+        description="当前最新尚欠（随后续入账的应补/应退凭证与收款冲正变化；补退不改旧分配）"
     )
     credit_yuan: float = Field(description="当前账户信用（允许为正）")
     payments: List[PaymentListItem] = Field(
-        description="全部收款记录，按收款次序（payment_seq 升序）；内容为首次冻结值"
+        description="全部收款记录，按收款次序（payment_seq 升序）；内容为首次冻结值，"
+        "被冲正的收款以 reversed / reversed_at 展示冲正状态"
     )
 
 
@@ -1150,4 +1164,84 @@ class PayoutListResponse(BaseModel):
     )
     payouts: List[PayoutListItem] = Field(
         description="全部退付记录，按退付次序（payout_seq 升序）；内容为首次冻结值"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 误记收款整笔冲正：按账户 + 原收款单号办理，原收款保留但不再计入有效实收
+# ---------------------------------------------------------------------------
+
+
+class PaymentReversalRequest(BaseModel):
+    """按账户冲正一笔误记收款：只需原收款单号（冲正金额即原收款金额，整笔）。
+
+    账户 ID 由路径 /accounts/{account_id}/payment-reversals 给出。
+    """
+
+    payment_no: str = Field(
+        min_length=1,
+        max_length=MAX_PAYMENT_NO_LEN,
+        description="要冲正的原收款单号：必须已登记在本账户；原单不存在或账户不符"
+        "明确拒绝，同账户同单号重复冲正返回首次冲正回执",
+    )
+
+
+class PaymentReversalReceiptResponse(BaseModel):
+    """一笔收款冲正的登记回执：首次 result=reversed，重复冲正 result=deduped。
+
+    重复冲正返回的始终是首次冲正时冻结的内容（冲正金额、冲正时间与冲正后
+    头寸快照），即使后来又入账新的应补/应退凭证、登记新收款或退付也不漂移。
+    """
+
+    account_id: str
+    payment_no: str = Field(description="被冲正的原收款单号")
+    result: Literal["reversed", "deduped"] = Field(
+        description="reversed=本次新冲正并原子落盘；deduped=同账户同单号重复冲正，"
+        "原样返回首次冲正回执"
+    )
+    amount_yuan: float = Field(description="冲正金额（= 原收款金额，整笔冲正）")
+    reversed_at: str = Field(description="首次冲正时间（UTC ISO 8601，重复冲正不漂移）")
+    total_received_yuan: float = Field(
+        description="冲正后账户累计有效实收（不再含本笔被冲正收款）"
+    )
+    outstanding_yuan: float = Field(
+        description="冲正后最新尚欠（按有效收款 + 已记应退 + 已付退付重算，≥0）"
+    )
+    credit_yuan: float = Field(
+        description="冲正后账户信用（应退抵减并扣除已付退付后的剩余，≥0，与尚欠不同时为正）"
+    )
+    reversal_count: int = Field(description="本次冲正后账户累计冲正笔数（含本笔）")
+
+
+class PaymentReversalListItem(BaseModel):
+    """冲正记录列表中的一条：落盘时冻结的首次冲正回执（列表中 result 恒为 reversed）。"""
+
+    account_id: str
+    payment_no: str = Field(description="被冲正的原收款单号")
+    result: Literal["reversed"] = Field(
+        description="列表只反映落盘事实：每条都是首次成功的冲正；"
+        "是否重复冲正请在提交接口看 result=deduped"
+    )
+    amount_yuan: float = Field(description="冲正金额（= 原收款金额）")
+    reversed_at: str = Field(description="首次冲正时间（UTC ISO 8601）")
+    total_received_yuan: float = Field(description="该笔冲正后的账户累计有效实收快照")
+    outstanding_yuan: float = Field(description="该笔冲正后的尚欠快照")
+    credit_yuan: float = Field(description="该笔冲正后的信用快照")
+    reversal_count: int = Field(description="该笔在账户内的冲正序号（1 起）")
+
+
+class PaymentReversalListResponse(BaseModel):
+    """按冲正次序查询账户全部冲正记录与当前最新尚欠/信用。"""
+
+    account_id: str
+    reversal_count: int = Field(description="账户累计冲正笔数")
+    total_reversed_yuan: float = Field(
+        description="当前账户累计冲正金额（全部冲正金额之和，随新增冲正增长）"
+    )
+    outstanding_yuan: float = Field(
+        description="当前最新尚欠（按有效收款 + 已记应退 + 已付退付重算）"
+    )
+    credit_yuan: float = Field(description="当前账户信用（允许为正）")
+    reversals: List[PaymentReversalListItem] = Field(
+        description="全部冲正记录，按冲正次序（reversal_seq 升序）；内容为首次冻结值"
     )

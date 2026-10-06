@@ -20,6 +20,9 @@ from app.models import (
     PaymentListResponse,
     PaymentReceiptResponse,
     PaymentRequest,
+    PaymentReversalListResponse,
+    PaymentReversalReceiptResponse,
+    PaymentReversalRequest,
     PayoutListResponse,
     PayoutReceiptResponse,
     PayoutRequest,
@@ -42,6 +45,7 @@ from app.models import (
 from app.payments import PaymentError, ledger_detail_with_position, list_payments, submit_payment
 from app.payouts import PayoutError, list_payouts, submit_payout
 from app.replan import ReplanError, execute_replan
+from app.reversals import ReversalError, list_reversals, submit_reversal
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
@@ -89,6 +93,15 @@ app = FastAPI(
         "单号换金额或跨账户使用返回 409；后续补退不改写旧收款分配，"
         "最新尚欠随凭证变化、允许显示信用；收款核对与落盘和原入账共用"
         "同一 SQLite 写事务，并发与重启后都不会重复核销。"
+        "/accounts/{账户ID}/payment-reversals 把误记的到账收款整笔冲正："
+        "按账户提交原收款单号（只接受原收款所属账户，原单不存在或账户不符"
+        "明确拒绝且不留冲正记录），原收款、逐凭证分配与首次收款回执保留，"
+        "冲正后该笔不再计入有效实收；台账明细逐凭证已收、账户累计实收与"
+        "台账/收款/退付查询的当前尚欠、信用按有效收款、已记应退与已付退付"
+        "重算，已发生的后续收款分配与退付保持原样；后续新收款按重算后尚欠"
+        "分配，原单号重试仍返回原收款回执；重复冲正返回首次冲正回执；"
+        "冲正核对与落盘和原入账、收款、退付共用同一 SQLite 写事务，"
+        "并发只能生效一次，收款查询展示冲正状态，重启后仍可查。"
         "/accounts/{账户ID}/payouts 把应退抵减未付凭证后剩余的账户信用"
         "实际退付：按账户提交全平台唯一退付单号 + 正金额，只能支付当前"
         "信用，信用不足整笔拒绝且不留记录；退付后台账与收款查询的当前"
@@ -99,7 +112,7 @@ app = FastAPI(
         "信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，"
         "并发不重复支付，重启后记录仍可查。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -199,6 +212,17 @@ async def payment_error_handler(request: Request, exc: PaymentError):
 async def payout_error_handler(request: Request, exc: PayoutError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如冲突单号的已登记账户/金额、超额时的当前信用/尚欠）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(ReversalError)
+async def reversal_error_handler(request: Request, exc: ReversalError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如原收款单号、原收款所属账户）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -593,6 +617,66 @@ async def list_account_payments(account_id: str) -> PaymentListResponse:
     """
     result = list_payments(account_id)
     return PaymentListResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 误记收款整笔冲正：按账户 + 原收款单号办理，原收款保留但不再计入有效实收
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/accounts/{account_id}/payment-reversals",
+    response_model=PaymentReversalReceiptResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "原收款单不存在"},
+        409: {"model": ErrorResponse, "description": "原收款登记在别的账户（附原收款账户）"},
+        422: {"model": ErrorResponse, "description": "收款单号为空或超长"},
+    },
+    tags=["ledger"],
+)
+async def post_account_payment_reversal(
+    account_id: str, req: PaymentReversalRequest
+) -> PaymentReversalReceiptResponse:
+    """按账户把一笔误记的到账收款整笔冲正。
+
+    - 只接受**原收款所属账户**办理：原收款单不存在 → 404 payment_not_found，
+      单号登记在别的账户 → 409 reversal_account_mismatch（错误体附原收款
+      账户），均**不留下冲正记录**；
+    - 冲正为整笔：冲正金额即原收款金额；原收款主行、逐凭证分配与首次收款
+      回执全部保留（收款查询中该笔标记 reversed 并附冲正时间），只是其
+      核销**不再计入有效实收**；
+    - 冲正后台账明细的逐凭证已收、账户累计实收，以及台账 / 收款 / 退付
+      查询的当前尚欠与信用，都按「有效收款 + 已记应退 + 已付退付」重算；
+      已发生的后续收款分配与退付保持原样，不回填历史分配；后续新收款按
+      重算后尚欠 FIFO 分配；原收款单号重试收款仍返回首次收款回执；
+    - 同一账户对同一单号**重复冲正** → result=deduped，返回首次冲正时
+      冻结的回执（冲正金额、冲正时间与冲正后头寸快照都不漂移）；
+    - 冲正核对、头寸重算与落盘和原入账、收款、退付共用同一 SQLite 写事务
+      （RLock + BEGIN IMMEDIATE），payment_no 主键兜底：并发冲正同一笔
+      收款只有一笔生效，失败一律回滚、不留冲正记录，进程重启后仍可查询。
+    """
+    result = submit_reversal(
+        account_id=account_id,
+        payment_no=req.payment_no,
+    )
+    return PaymentReversalReceiptResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/payment-reversals",
+    response_model=PaymentReversalListResponse,
+    tags=["ledger"],
+)
+async def list_account_payment_reversals(account_id: str) -> PaymentReversalListResponse:
+    """按冲正次序（reversal_seq 升序）查询账户全部冲正记录与当前最新头寸。
+
+    每条记录均为首次冲正时冻结的回执（冲正金额、冲正时间与当时头寸快照）；
+    账户级 total_reversed_yuan 为当前累计冲正金额，outstanding_yuan /
+    credit_yuan 为按当前全部凭证、有效收款与已落盘退付重算的最新值。
+    从未入账也无冲正的账户返回全 0/空。
+    """
+    result = list_reversals(account_id)
+    return PaymentReversalListResponse.model_validate(result)
 
 
 # ---------------------------------------------------------------------------

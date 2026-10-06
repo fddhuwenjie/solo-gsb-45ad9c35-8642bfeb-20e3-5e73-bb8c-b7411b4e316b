@@ -29,9 +29,9 @@
 - 先把账户内**全部已记应退**（无论其入账在正额凭证之前还是之后）汇成一个
   应退池，并**先扣除全部已落盘退付**（退付只动信用、不动逐凭证核销），
   再按原入账顺序（entry_no 升序）逐张处理正额凭证：
-  每张正额凭证上，已落盘收款核销（现金）先受保护，池子只抵减
-  「应收 − 已收款」的未核销部分（applied = min(剩余池, 应收 − 已收款)），
-  抵减后其余额即该凭证最新尚欠；
+  每张正额凭证上，已落盘且**未被冲正**的收款核销（有效现金）先受保护，
+  池子只抵减「应收 − 有效已收款」的未核销部分
+  （applied = min(剩余池, 应收 − 有效已收款)），抵减后其余额即该凭证最新尚欠；
 - 遍历结束后池中剩余即账户信用 credit_yuan；
   全部正额凭证尚欠之和即 outstanding_yuan（与信用不同时为正）。
 这套「当前重算」只读取冻结的现金核销与已落盘退付，从不改写它们：后来补退
@@ -39,6 +39,11 @@
 旧收款分配与旧退付回执原样保留。退付在池中最先扣除：退付时刻已核验
 「退付 ≤ 当时信用」，故池不会为负，且退付本身不改变任何凭证的尚欠；
 之后入账的应补/应退仍按同一口径与已扣退付的池子重新抵减。
+**整笔冲正**（见 app/reversals.py）把误记收款的核销排除出有效实收：
+原收款主行、逐凭证分配与首次收款回执全部保留，只是重算时该笔核销不再
+计入——逐凭证已收、账户累计实收与当前尚欠/信用随之按「有效收款 + 已记
+应退 + 已付退付」重算；已发生的后续收款分配与退付保持原样，不回填历史
+分配，后续新收款按重算后尚欠分配。
 
 HTTP 错误码：
 - payment_empty_account：账户尚无已入账凭证，没有可登记的应收（422）；
@@ -89,19 +94,24 @@ def _round6(x: float) -> float:
     return round(x + 0.0, 6) + 0.0
 
 
-def account_position(conn, store: SessionStore, account_id: str) -> dict:
+def account_position(conn, store: SessionStore, account_id: str,
+                     exclude_payment_nos: Optional[frozenset] = None) -> dict:
     """在给定连接上重算账户当前头寸：逐凭证尚欠、账户尚欠与信用、累计实收。
 
     应退抵减与凭证入账先后无关：账户内**全部已记应退**（billing=refund）汇成
     一个应退池，**先扣除全部已落盘退付**（退付只消耗信用，不产生逐凭证核销），
     再按原入账顺序（entry_no 升序）逐张抵减正额凭证
-    （full/supplement）**尚未被收款核销的部分**：
-      每张正额凭证上 applied = min(剩余应退池, 应收 − 已落盘收款核销)，
+    （full/supplement）**尚未被有效收款核销的部分**：
+      每张正额凭证上 applied = min(剩余应退池, 应收 − 有效收款核销)，
     抵减后剩余为该凭证最新尚欠；遍历结束后池中剩余即账户信用。
-    已落盘的收款核销（现金）优先于应退池受保护：后来补退最多抵掉「应收 −
-    已收款」，旧收款分配永不被改写；no_adjustment 为 0 元明细，不参与。
+    已落盘且**未被冲正**的收款核销（现金）优先于应退池受保护：后来补退最多
+    抵掉「应收 − 已收款」，旧收款分配永不被改写；**已整笔冲正的收款其核销
+    不再计入有效实收**（原收款与核销行保留，见 app/reversals.py）；
+    no_adjustment 为 0 元明细，不参与。
+    exclude_payment_nos 用于冲正落盘前预演「冲正后」口径（把待冲正单号
+    一并按无效排除）。
     返回 entries（与 ledger 明细同序，附 receivable/refund_applied/paid/
-    outstanding）与账户级 totals（含 total_received_yuan 累计实收与
+    outstanding）与账户级 totals（含 total_received_yuan 累计有效实收与
     total_paid_out_yuan 累计退付）。
     """
     rows = store.list_ledger_entry_rows_in_txn(conn, account_id)
@@ -127,10 +137,11 @@ def account_position(conn, store: SessionStore, account_id: str) -> dict:
         entry = _entry_response(row)
 
         if signed > _EPS:
-            # 正额凭证：已落盘收款核销先受保护，应退池只抵减尚未核销的部分。
+            # 正额凭证：已落盘且未冲正的收款核销先受保护，应退池只抵减尚未核销的部分。
             cash = _round6(
                 store.sum_cash_by_voucher(
-                    conn, account_id, row["session_id"], int(row["voucher_no"])
+                    conn, account_id, row["session_id"], int(row["voucher_no"]),
+                    exclude_payment_nos,
                 )
             )
             if cash > signed + _EPS:  # 不变量兜底：现金不可能超过应收
@@ -338,28 +349,39 @@ def list_payments(
     account_id: str,
     store: Optional[SessionStore] = None,
 ) -> dict:
-    """按收款次序查询账户全部收款记录（均为落盘时冻结的首收回执）。"""
+    """按收款次序查询账户全部收款记录（均为落盘时冻结的首收回执）。
+
+    每条记录附冲正状态（reversed / reversed_at）：被整笔冲正的收款其记录、
+    逐凭证分配与首收回执保持原样，只是不再计入账户级累计有效实收
+    （total_received_yuan 只汇总未冲正收款）。
+    """
     store = store or get_store()
     with store._connect() as conn:
         position = account_position(conn, store, account_id)
         totals = position["totals"]
         rows = store.list_payment_rows(account_id)
+        reversal_rows = store.list_reversal_rows(account_id)
 
+    reversed_at_by_no = {r["payment_no"]: r["reversed_at"] for r in reversal_rows}
     payments: List[dict] = []
-    total_received_check = 0.0
+    total_received_valid = 0.0
     for row in rows:
         receipt = json.loads(row["receipt_json"])
         # 正常列表查询：首收记录保持 received（重试时才在提交接口标 deduped）。
         receipt["result"] = "received"
+        reversed_at = reversed_at_by_no.get(row["payment_no"])
+        receipt["reversed"] = reversed_at is not None
+        receipt["reversed_at"] = reversed_at
         payments.append(receipt)
-        total_received_check = _round6(
-            total_received_check + float(row["amount_yuan"])
-        )
+        if reversed_at is None:  # 只把有效（未冲正）收款计入累计实收
+            total_received_valid = _round6(
+                total_received_valid + float(row["amount_yuan"])
+            )
 
     return {
         "account_id": account_id,
         "payment_count": len(payments),
-        "total_received_yuan": _round6(total_received_check),
+        "total_received_yuan": _round6(total_received_valid),
         "outstanding_yuan": totals["outstanding_yuan"],
         "credit_yuan": totals["credit_yuan"],
         "payments": payments,
