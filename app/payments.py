@@ -338,28 +338,52 @@ def list_payments(
     account_id: str,
     store: Optional[SessionStore] = None,
 ) -> dict:
-    """按收款次序查询账户全部收款记录（均为落盘时冻结的首收回执）。"""
+    """按收款次序查询账户全部收款记录（均为落盘时冻结的首收回执）。
+
+    每条收款附冲正状态（reversed / reversed_at / reversal_amount_yuan）：
+    未冲正为 reversed=false；已冲正收款的回执内容仍为首次冻结值，但其金额
+    不再计入账户级有效累计实收 total_received_yuan（头寸由 account_position
+    只按未冲正核销重算）。
+    """
+    # 延迟导入避免模块循环（reversals 反向依赖 payments.account_position）。
+    from app.reversals import reversal_map_for_account
+
     store = store or get_store()
     with store._connect() as conn:
         position = account_position(conn, store, account_id)
         totals = position["totals"]
         rows = store.list_payment_rows(account_id)
+        reversals = reversal_map_for_account(conn, store, account_id)
 
     payments: List[dict] = []
-    total_received_check = 0.0
     for row in rows:
         receipt = json.loads(row["receipt_json"])
         # 正常列表查询：首收记录保持 received（重试时才在提交接口标 deduped）。
         receipt["result"] = "received"
+        status = reversals.get(row["payment_no"])
+        if status is not None:
+            receipt["reversed"] = True
+            receipt["reversed_at"] = status["reversed_at"]
+            receipt["reversal_amount_yuan"] = status["reversal_amount_yuan"]
+        else:
+            receipt["reversed"] = False
+            receipt["reversed_at"] = None
+            receipt["reversal_amount_yuan"] = None
         payments.append(receipt)
-        total_received_check = _round6(
-            total_received_check + float(row["amount_yuan"])
+
+    # 账户级累计实收只计有效（未冲正）收款；已冲正收款金额由头寸重算排除。
+    effective_total = _round6(
+        sum(
+            float(r["amount_yuan"])
+            for r in rows
+            if r["payment_no"] not in reversals
         )
+    )
 
     return {
         "account_id": account_id,
         "payment_count": len(payments),
-        "total_received_yuan": _round6(total_received_check),
+        "total_received_yuan": effective_total,
         "outstanding_yuan": totals["outstanding_yuan"],
         "credit_yuan": totals["credit_yuan"],
         "payments": payments,

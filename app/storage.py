@@ -41,11 +41,19 @@
   首次回执，单号换金额或跨账户复用判 409；(account_id, payout_seq)
   唯一键保证账户内退付次序连续。已落盘退付在头寸重算时从应退池中
   扣除（只动信用、不动逐凭证核销），信用不足时整笔拒绝、本表不写。
+- account_payment_reversals 为误记收款的整笔冲正：以被冲正的
+  payment_no 为主键（一笔收款最多冲正一次，重试原样返回首次冲正
+  回执），冲正行冻结冲正金额、冲正时间与冲正后头寸快照；原收款主行、
+  逐凭证核销与首收回执永不被改写，头寸重算（sum_cash_by_voucher /
+  累计实收）只统计未冲正收款的核销，已发生的后续收款分配与退付保持
+  原样、不回填历史分配；冲正与核对、落盘、入账、收款、退付共用同一
+  把写事务锁，失败回滚不留冲正记录。
 - 旧库只有 sessions / session_records 两张表时，session_batches、
   session_revisions、session_settlement_vouchers、account_ledger_entries、
-  account_payments、account_payment_allocations 与 account_payouts 由
-  CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index 续报
-  不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
+  account_payments、account_payment_allocations、account_payouts 与
+  account_payment_reversals 由 CREATE TABLE IF NOT EXISTS 自动补齐
+  （空表）：查询与从 next_index 续报不受影响；已确认区间内没有批次
+  边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -180,10 +188,24 @@ CREATE TABLE IF NOT EXISTS account_payouts (
 );
 CREATE INDEX IF NOT EXISTS idx_payouts_account_order
     ON account_payouts(account_id, payout_seq);
+CREATE TABLE IF NOT EXISTS account_payment_reversals (
+    reversal_id TEXT NOT NULL,
+    payment_no TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    amount_yuan REAL NOT NULL,
+    receipt_json TEXT NOT NULL,
+    reversed_at TEXT NOT NULL,
+    PRIMARY KEY (payment_no),
+    FOREIGN KEY (payment_no) REFERENCES account_payments(payment_no)
+);
+CREATE INDEX IF NOT EXISTS idx_reversals_account
+    ON account_payment_reversals(account_id, reversed_at);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
 # （CREATE TABLE IF NOT EXISTS 不会改已存在的表结构。）
+# account_payment_reversals 为误记收款整笔冲正表（后加的新表，旧库打开时
+# 由 IF NOT EXISTS 自动补建）。
 _LEDGER_COLUMN_MIGRATIONS = (
     ("relative_to_revision", "INTEGER"),
     ("relative_to_voucher_no", "INTEGER"),
@@ -743,11 +765,19 @@ class SessionStore:
         session_id: str,
         voucher_no: int,
     ) -> float:
-        """写事务内汇总某张已入账凭证名下全部已落盘收款核销额（用于重算尚欠）。"""
+        """写事务内汇总某张已入账凭证名下全部**有效**（未冲正）收款核销额。
+
+        已冲正收款的逐凭证核销行保留为历史证据，但其金额不再计入有效实收：
+        NOT EXISTS 冲正行的核销才参与头寸重算（冲正后不回填历史分配，后续
+        新收款按重算后的尚欠重新 FIFO 分配）。
+        """
         row = conn.execute(
-            "SELECT COALESCE(SUM(allocated_yuan), 0.0) AS s"
-            " FROM account_payment_allocations"
-            " WHERE account_id = ? AND session_id = ? AND voucher_no = ?",
+            "SELECT COALESCE(SUM(a.allocated_yuan), 0.0) AS s"
+            " FROM account_payment_allocations a"
+            " WHERE a.account_id = ? AND a.session_id = ? AND a.voucher_no = ?"
+            " AND NOT EXISTS ("
+            "     SELECT 1 FROM account_payment_reversals r"
+            "     WHERE r.payment_no = a.payment_no)",
             (account_id, session_id, voucher_no),
         ).fetchone()
         return float(row["s"])
@@ -820,6 +850,62 @@ class SessionStore:
                     (account_id,),
                 ).fetchall()
             )
+
+    # ------------------------------------------------------------------
+    # 误记收款的整笔冲正（以 payment_no 为主键，一笔收款最多冲正一次）
+    # ------------------------------------------------------------------
+
+    def get_reversal(
+        self, conn: sqlite3.Connection, payment_no: str
+    ) -> Optional[sqlite3.Row]:
+        """写事务内按被冲正收款单号取冲正行；从未冲正返回 None（重试幂等判定）。"""
+        return conn.execute(
+            "SELECT * FROM account_payment_reversals WHERE payment_no = ?",
+            (payment_no,),
+        ).fetchone()
+
+    def list_reversal_rows_for_account(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> List[sqlite3.Row]:
+        """写事务内列出账户全部冲正行（收款查询展示冲正状态用）。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM account_payment_reversals"
+                " WHERE account_id = ? ORDER BY reversed_at, payment_no",
+                (account_id,),
+            ).fetchall()
+        )
+
+    def insert_reversal(
+        self,
+        conn: sqlite3.Connection,
+        reversal_id: str,
+        payment_no: str,
+        account_id: str,
+        amount_yuan: float,
+        receipt_json: str,
+        reversed_at: str,
+    ) -> None:
+        """与「核对原收款 → 冲正后头寸重算」同一事务原子落盘冲正行。
+
+        payment_no 主键在数据库层兜底：并发冲正同一收款只有一笔成功，
+        其余原样取回首次冲正回执；任一核对失败事务回滚，不留冲正记录。
+        原收款主行与逐凭证核销不被改写（冲正行是独立的冲正证据）。
+        """
+        conn.execute(
+            "INSERT INTO account_payment_reversals"
+            "(reversal_id, payment_no, account_id, amount_yuan,"
+            " receipt_json, reversed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                reversal_id,
+                payment_no,
+                account_id,
+                amount_yuan,
+                receipt_json,
+                reversed_at,
+            ),
+        )
 
 
 _store: Optional[SessionStore] = None

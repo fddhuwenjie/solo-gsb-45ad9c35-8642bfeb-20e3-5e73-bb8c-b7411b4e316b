@@ -20,6 +20,7 @@ from app.models import (
     PaymentListResponse,
     PaymentReceiptResponse,
     PaymentRequest,
+    PaymentReversalReceiptResponse,
     PayoutListResponse,
     PayoutReceiptResponse,
     PayoutRequest,
@@ -43,6 +44,7 @@ from app.payments import PaymentError, ledger_detail_with_position, list_payment
 from app.payouts import PayoutError, list_payouts, submit_payout
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
+from app.reversals import ReversalError, reverse_payment
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
@@ -98,8 +100,17 @@ app = FastAPI(
         "同单号同账户同金额重试返回首次回执，换账户或金额返回 409；"
         "信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，"
         "并发不重复支付，重启后记录仍可查。"
+        "另提供 POST /accounts/{账户ID}/payments/{原收款单号}/reversal "
+        "把误记的到账收款整笔冲正：只接受原收款所属账户（原单不存在 404、"
+        "账户不符 422、重复冲正返回首次冲正回执）；保留原收款、逐凭证分配"
+        "与首次收款回执，冲正后该笔不再计入有效实收，逐凭证已收、账户累计"
+        "实收及台账/收款/退付查询的当前尚欠与信用按有效收款、已记应退及"
+        "已付退付重算，已发生的后续收款分配与退付不回填；后续新收款按重算后"
+        "尚欠分配，原单号重试收款仍返回原收款回执；核对、落盘与入账、收款、"
+        "退付共用同一 SQLite 写事务，并发只能生效一次，失败不留冲正记录，"
+        "收款查询展示冲正状态，重启后可查。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -199,6 +210,17 @@ async def payment_error_handler(request: Request, exc: PaymentError):
 async def payout_error_handler(request: Request, exc: PayoutError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如冲突单号的已登记账户/金额、超额时的当前信用/尚欠）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(ReversalError)
+async def reversal_error_handler(request: Request, exc: ReversalError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如原收款所属账户、原收款单号）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -593,6 +615,36 @@ async def list_account_payments(account_id: str) -> PaymentListResponse:
     """
     result = list_payments(account_id)
     return PaymentListResponse.model_validate(result)
+
+
+@app.post(
+    "/accounts/{account_id}/payments/{payment_no}/reversal",
+    response_model=PaymentReversalReceiptResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "原收款单号不存在"},
+        422: {"model": ErrorResponse, "description": "原收款属于别的账户（只接受原收款所属账户）"},
+    },
+    tags=["ledger"],
+)
+async def reverse_account_payment(account_id: str, payment_no: str) -> PaymentReversalReceiptResponse:
+    """把一笔误记的到账收款按账户与原收款单号**整笔冲正**。
+
+    - 只接受原收款**所属账户**办理：原单不存在 → 404 payment_not_found；
+      账户不符 → 422 payment_account_mismatch（附原登记 account_id）；
+    - 冲正整笔生效但**保留原收款、逐凭证分配与首次收款回执**：只新增一行
+      冲正记录，冲正后该笔不再计入有效实收，逐凭证已收、账户累计实收及
+      台账/收款/退付查询的当前尚欠与信用，按有效收款、已记应退及已付退付
+      金额重算；已发生的后续收款分配与退付保持原样、**不回填历史分配**；
+    - 后续新收款按重算后尚欠分配；对原单号重试收款仍返回原收款回执
+      （原单不复活、不二次核销）；
+    - 同一原收款单重复冲正 → result=deduped，返回首次冲正回执（冲正金额、
+      冲正时间与冲正后头寸快照不漂移）；
+    - 核对、冲正落盘与头寸重算和原入账、收款、退付共用同一 SQLite 写事务
+      （RLock + BEGIN IMMEDIATE），冲正行以 payment_no 为主键：并发冲正同一
+      笔只有一笔生效，失败回滚不留冲正记录；重启后冲正仍可查。
+    """
+    result = reverse_payment(account_id=account_id, payment_no=payment_no)
+    return PaymentReversalReceiptResponse.model_validate(result)
 
 
 # ---------------------------------------------------------------------------

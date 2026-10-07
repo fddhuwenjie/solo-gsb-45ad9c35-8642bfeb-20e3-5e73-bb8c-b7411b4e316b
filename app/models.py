@@ -1044,6 +1044,17 @@ class PaymentListItem(BaseModel):
     outstanding_yuan: float = Field(description="该笔登记当时的尚欠快照")
     credit_yuan: float = Field(description="该笔登记当时的信用快照")
     payment_count: int = Field(description="该笔在账户内的收款序号（1 起）")
+    reversed: bool = Field(
+        default=False,
+        description="该收款是否已被整笔冲正：true 时其金额不再计入账户有效实收，"
+        "但原收款记录、逐凭证分配与首收回执仍保留可查",
+    )
+    reversed_at: Optional[str] = Field(
+        default=None, description="冲正时间（UTC ISO 8601）；未冲正为 null"
+    )
+    reversal_amount_yuan: Optional[float] = Field(
+        default=None, description="冲正金额（=原收款金额）；未冲正为 null"
+    )
 
 
 class PaymentListResponse(BaseModel):
@@ -1150,4 +1161,42 @@ class PayoutListResponse(BaseModel):
     )
     payouts: List[PayoutListItem] = Field(
         description="全部退付记录，按退付次序（payout_seq 升序）；内容为首次冻结值"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 误记收款的整笔冲正：按账户与原收款单号办理，冲正后不再计入有效实收
+# ---------------------------------------------------------------------------
+
+
+class PaymentReversalReceiptResponse(BaseModel):
+    """一笔误记收款的整笔冲正回执：首次 result=reversed，重复冲正 result=deduped。
+
+    重复冲正返回的始终是首次冲正时冻结的内容（冲正金额、冲正时间与冲正后
+    头寸快照），即使后来又发生新的收款、退付或凭证入账也不漂移。原收款主行、
+    逐凭证分配与首次收款回执均保留，冲正只新增独立的冲正记录。
+    """
+
+    account_id: str
+    payment_no: str = Field(description="被冲正的原收款单号（全平台唯一）")
+    result: Literal["reversed", "deduped"] = Field(
+        description="reversed=本次整笔冲正并原子落盘；deduped=同一原收款单重复冲正，"
+        "原样返回首次冲正回执"
+    )
+    reversal_id: str = Field(description="本次冲正回执 ID（UUID，首次冲正冻结，重试不漂移）")
+    amount_yuan: float = Field(
+        description="冲正金额（=原收款金额，整笔冲正）；冲正后该笔不再计入有效实收"
+    )
+    reversed_at: str = Field(description="首次冲正时间（UTC ISO 8601，重试不漂移）")
+    total_received_yuan: float = Field(
+        description="冲正后账户有效累计实收（已剔除被冲正收款；重试时为首次冲正当时快照）"
+    )
+    total_paid_out_yuan: float = Field(
+        description="冲正后账户累计已付退付（已发生退付保持原样，不因冲正回填）"
+    )
+    outstanding_yuan: float = Field(
+        description="冲正后最新尚欠：按有效收款、已记应退与已付退付对全部凭证重算（≥0）"
+    )
+    credit_yuan: float = Field(
+        description="冲正后账户信用（应退抵减并扣除已付退付后的剩余，≥0，与尚欠不同时为正）"
     )
